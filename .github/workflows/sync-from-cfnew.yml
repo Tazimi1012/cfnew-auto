@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+env:
+  CF_ACCOUNT_ID: "8bae7063eecf057ed2c497b9bedd3bd7"
+  KV_NAMESPACE_ID: "28f1800d6c394c33ac0bddf15a54445e"
+  WORKER_NAME: "cfnew-core"
+  WORKER_HOST: "zmq.kdns.fr"
+  COMPAT_DATE: "2026-01-20"
+
 jobs:
   sync-core:
     runs-on: ubuntu-latest
@@ -57,7 +64,7 @@ jobs:
           printf '%s\n%s\n' "${{ steps.up.outputs.sha }}" "${{ steps.up.outputs.date }}" > VERSION.txt
           cat VERSION.txt
 
-      - name: 提交并推送
+      - name: 提交并推送（GitHub 侧存档）
         if: steps.cmp.outputs.changed == 'true'
         run: |
           git config user.email "action@github.com"
@@ -70,6 +77,46 @@ jobs:
             git push
             echo "已提交并推送更新"
           fi
+
+      - name: 部署到 Cloudflare Worker
+        if: steps.cmp.outputs.changed == 'true'
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          WORKER_UUID: ${{ secrets.CF_WORKER_UUID }}
+        run: |
+          set -e
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "::warning::未配置 CF_API_TOKEN，跳过 Worker 部署（仅完成 GitHub 侧存档）"
+            exit 0
+          fi
+          HTTP=$(curl -sS --fail-with-body -o deploy.json -w "%{http_code}" -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -F "metadata={\"main_module\":\"_worker.js\",\"compatibility_date\":\"${COMPAT_DATE}\",\"bindings\":[{\"type\":\"kv_namespace\",\"name\":\"c\",\"namespace_id\":\"${KV_NAMESPACE_ID}\"},{\"type\":\"plain_text\",\"name\":\"u\",\"text\":\"${WORKER_UUID}\"}]};type=application/json" \
+            -F "_worker.js=@_worker.js;type=application/javascript+module")
+          echo "Cloudflare 返回 HTTP $HTTP"
+          cat deploy.json
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Worker 部署失败"
+            exit 1
+          fi
+
+      - name: 部署后验证
+        if: steps.cmp.outputs.changed == 'true'
+        env:
+          WORKER_UUID: ${{ secrets.CF_WORKER_UUID }}
+        run: |
+          set -e
+          sleep 5
+          ROOT=$(curl -sS "https://${WORKER_HOST}/")
+          echo "Worker 首页: $ROOT"
+          [ "$ROOT" = "hello" ] || { echo "::error::首页返回异常"; exit 1; }
+          CFG=$(curl -sS "https://${WORKER_HOST}/${WORKER_UUID}/api/config")
+          echo "$CFG" | head -c 400
+          echo ""
+          echo "$CFG" | jq -e '.coreVersion and .kvEnabled == true' > /dev/null \
+            || { echo "::error::配置接口校验失败"; exit 1; }
+          echo "✅ 部署验证通过"
 
       - name: 输出摘要
         run: |
